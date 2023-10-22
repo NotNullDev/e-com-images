@@ -1,6 +1,10 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
 	"testing"
 	"time"
 )
@@ -44,6 +48,55 @@ func Test_nonExpiredTokenIsValid(t *testing.T) {
 
 	if !isValid {
 		t.Fatalf("token should be valid but is not")
+		return
+	}
+}
+
+func Test_healthEndpointIsWorking(t *testing.T) {
+	router := NewRouter()
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/health")
+	if err != nil {
+		t.Fatalf(err.Error())
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("Invalid response code: expected [200], received [%d]", resp.StatusCode)
+		return
+	}
+}
+
+func Test_PresignWorks(t *testing.T) {
+	os.Setenv("JWT_SECRET", secret)
+	mustBindEnv()
+
+	router := NewRouter()
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	client := http.Client{}
+
+	presignUrl, _ := url.Parse(server.URL + "/images/presign/")
+
+	req := http.Request{
+		URL: presignUrl,
+		Header: map[string][]string{
+			"Authorization": {"Bearer " + createdToken},
+		},
+		Method: "GET",
+	}
+
+	resp, err := client.Do(&req)
+	if err != nil {
+		t.Fatalf(err.Error())
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("Invalid response code: expected [200], received [%d]", resp.StatusCode)
 		return
 	}
 }

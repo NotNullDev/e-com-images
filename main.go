@@ -8,28 +8,53 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Environment struct {
-	JwtSecret  string `json:"jwtSecret"`
-	ServerPort string `json:"serverPort"`
+	JwtSecret     string `json:"jwtSecret"`
+	ServerPort    string `json:"serverPort"`
+	PresignLifeMs int    `json:"presignLifeMs"`
 }
 
 type ErrorMessage struct {
 	Error string `json:"error"`
 }
 
+type PresignedTokens struct {
+	presignedTokens []jwt.Token
+	tokensLock      sync.Mutex
+}
+
+var presignedTokens = PresignedTokens{
+	presignedTokens: make([]jwt.Token, 0),
+	tokensLock:      sync.Mutex{},
+}
+
+type PresignTokenResponse struct {
+	Token string `json:"token"`
+}
+
 var env Environment
+var createdToken string
+
+const (
+	defaultServerPort           = "8080"
+	defaultPresignLifeMs        = 1000 * 60 * 5
+	defaultTokenCleanerInterval = 5 * time.Minute
+
+	presignTokenQueryParamName = "presignToken"
+)
 
 func main() {
-	router := chi.NewRouter()
-
 	mustBindEnv()
 	createAndPrintJwt()
+	startTokenCleaner(defaultTokenCleanerInterval)
 
-	initRoutes(router)
+	router := NewRouter()
 
 	err := http.ListenAndServe(":"+env.ServerPort, router)
 	if err != nil {
@@ -37,7 +62,19 @@ func main() {
 	}
 }
 
+func NewRouter() *chi.Mux {
+	router := chi.NewRouter()
+	initRoutes(router)
+
+	return router
+}
+
 func initRoutes(r *chi.Mux) {
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+	})
+
 	r.Route("/images", func(r chi.Router) {
 		r.Use(validToken)
 
@@ -45,12 +82,67 @@ func initRoutes(r *chi.Mux) {
 			w.WriteHeader(200)
 			w.Write([]byte("you are in!"))
 		})
+
+		r.Get("/presign", func(writer http.ResponseWriter, request *http.Request) {
+			token := createTokenWithExpire(env.JwtSecret, defaultPresignLifeMs)
+			writeResponse(writer, PresignTokenResponse{
+				Token: token,
+			}, 200)
+		})
+	})
+	r.Route("/upload", func(r chi.Router) {
+		r.Post("/", func(writer http.ResponseWriter, r *http.Request) {
+			token := r.URL.Query().Get(presignTokenQueryParamName)
+			if token == "" {
+				writeError(writer, fmt.Sprintf("[%s] queryParam is missing", presignTokenQueryParamName), 400)
+			}
+
+			if !isTokenValid(env.JwtSecret, token) {
+				writeError(writer, "Invalid presigned token", 403)
+			}
+		})
 	})
 }
 
+func startTokenCleaner(cleanEveryMs time.Duration) {
+	go func() {
+		logInfo("Token cleaner started job")
+		var indexesToDelete []int
+
+		presignedTokens.tokensLock.Lock()
+
+		for idx, token := range presignedTokens.presignedTokens {
+			if token.Claims == nil {
+				logError("claims are missing from in the token")
+				indexesToDelete = append(indexesToDelete, idx)
+				continue
+			}
+
+			exp, err := token.Claims.GetExpirationTime()
+			if err != nil {
+				logError("expiration date is missing in the token")
+				indexesToDelete = append(indexesToDelete, idx)
+				continue
+			}
+
+			if exp.After(time.Now()) {
+				indexesToDelete = append(indexesToDelete, idx)
+			}
+		}
+
+		for _, toDeleteIdx := range indexesToDelete {
+			presignedTokens.presignedTokens = append(presignedTokens.presignedTokens[:toDeleteIdx], presignedTokens.presignedTokens[toDeleteIdx:]...)
+		}
+
+		presignedTokens.tokensLock.Unlock()
+		logInfo(fmt.Sprintf("Token cleaner completed job. Removed %d from %d keys", len(indexesToDelete), len(presignedTokens.presignedTokens)))
+		time.Sleep(cleanEveryMs)
+	}()
+}
+
 func createAndPrintJwt() {
-	token := createToken(env.JwtSecret)
-	logInfo(fmt.Sprintf("API KEY: [%s]", token))
+	createdToken = createToken(env.JwtSecret)
+	logInfo(fmt.Sprintf("API KEY: [%s]", createdToken))
 }
 
 func mustBindEnv() {
@@ -63,9 +155,20 @@ func mustBindEnv() {
 
 	serverPort := os.Getenv("SERVER_PORT")
 	if serverPort == "" {
-		serverPort = "8080"
+		serverPort = defaultServerPort
 	}
 	env.ServerPort = serverPort
+
+	presignLifeMsString := os.Getenv("PRESIGN_LIFE_MS")
+	env.PresignLifeMs = defaultPresignLifeMs
+
+	if presignLifeMsString != "" {
+		resignedLife, err := strconv.Atoi(presignLifeMsString)
+		if err != nil {
+			logError(fmt.Sprintf("Invalid PRESIGN_LIFE_MS, falling back to default: [%d]ms", env.PresignLifeMs))
+		}
+		env.PresignLifeMs = resignedLife
+	}
 
 }
 
@@ -75,7 +178,7 @@ func validToken(next http.Handler) http.Handler {
 		apiKeyParts := strings.Split(apiKey, "Bearer ")
 
 		if len(apiKeyParts) != 2 {
-			writerError(w, "authorization header is not in a valid format", 400)
+			writeError(w, "authorization header is not in a valid format", 400)
 			return
 		}
 
@@ -86,11 +189,11 @@ func validToken(next http.Handler) http.Handler {
 			return
 		}
 
-		writerError(w, "Invalid api key", 403)
+		writeError(w, "Invalid api key", 403)
 	})
 }
 
-func writerError(w http.ResponseWriter, errorMessage string, errorCode int) {
+func writeError(w http.ResponseWriter, errorMessage string, errorCode int) {
 	errContent := ErrorMessage{
 		Error: errorMessage,
 	}
@@ -100,7 +203,20 @@ func writerError(w http.ResponseWriter, errorMessage string, errorCode int) {
 		return
 	}
 
+	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(errorCode)
+	w.Write(respBody)
+}
+
+func writeResponse(w http.ResponseWriter, body interface{}, code int) {
+	respBody, err := json.Marshal(body)
+	if err != nil {
+		logError(err.Error())
+		return
+	}
+
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(code)
 	w.Write(respBody)
 }
 
@@ -149,4 +265,20 @@ func logError(err string) {
 
 func logInfo(msg string) {
 	log.Printf("[INFO] %s", msg)
+}
+
+func (tokens *PresignedTokens) IsBlackmailed(token jwt.Token) bool {
+	tokens.tokensLock.Lock()
+	for _, t := range tokens.presignedTokens {
+		if string(t.Signature) == string(token.Signature) {
+			return true
+		}
+	}
+	tokens.tokensLock.Unlock()
+	return false
+}
+
+func (tokens *PresignedTokens) AddToBlackmail(token jwt.Token) {
+	tokens.tokensLock.Lock()
+	tokens.presignedTokens = append(tokens.presignedTokens, token)
 }
