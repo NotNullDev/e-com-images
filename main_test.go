@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -143,4 +144,52 @@ func Test_PresignDoesntWorksWithModifiedDefaultJWT(t *testing.T) {
 		t.Fatalf("Invalid response code: expected [403], received [%d]", resp.StatusCode)
 		return
 	}
+}
+
+var tmpFilePattern = "write-to-disk-test-file-*"
+
+func BenchmarkWriteToDiskAlloc(b *testing.B) {
+	var fNames []string
+
+	os.Mkdir("files", 0777)
+
+	for i := 0; i < b.N; i++ {
+		temp, err := os.CreateTemp(os.TempDir(), tmpFilePattern)
+		if err != nil {
+			panic(err.Error())
+		}
+		write, err := temp.Write([]byte("hello world!"))
+		if err != nil || write == 0 {
+			panic("Failed to create dummy file!")
+		}
+		fNames = append(fNames, temp.Name())
+	}
+
+	defer func() {
+		for _, fName := range fNames {
+			err := os.Remove(fName)
+			if err != nil {
+				println(err.Error())
+			}
+		}
+		fmt.Printf("Removed %d files", len(fNames))
+	}()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		createdFileName, err := writeFileToDisk(fNames[i], "files")
+		if err != nil {
+			b.Fatalf("Failed to create file with name [%s]", fNames[i])
+			return
+		}
+		_ = createdFileName
+	}
+
+	b.StopTimer()
+}
+
+func toTest() {
+	time.Sleep(1 * time.Second)
 }

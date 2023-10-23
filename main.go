@@ -17,10 +17,10 @@ import (
 )
 
 type Environment struct {
-	JwtSecret            string `json:"jwtSecret"`
-	ServerPort           string `json:"serverPort"`
-	PresignLifeMs        int    `json:"presignLifeMs"`
-	FileStorageDirectory string `json:"fileStorageDirectory"`
+	JwtSecret            string        `json:"jwtSecret"`
+	ServerPort           string        `json:"serverPort"`
+	PresignLifeMs        time.Duration `json:"presignLifeMs"`
+	FileStorageDirectory string        `json:"fileStorageDirectory"`
 }
 
 type ErrorMessage struct {
@@ -42,12 +42,16 @@ type PresignTokenResponse struct {
 	Token string `json:"token"`
 }
 
+type UploadFileResponse struct {
+	FileName string `json:"fileName"`
+}
+
 var env Environment
 var createdToken string
 
 const (
 	defaultServerPort           = "8080"
-	defaultPresignLifeMs        = 1000 * 60 * 5
+	defaultPresignLifeMs        = 1000 * 60 * 5 // 5 minutes
 	defaultTokenCleanerInterval = 5 * time.Minute
 	defaultFileStorageDirectory = "files"
 )
@@ -82,6 +86,8 @@ func NewRouter() *chi.Mux {
 }
 
 func initRoutes(r *chi.Mux) {
+	r.Handle("/public/*", http.StripPrefix("/public/", http.FileServer(http.Dir("files"))))
+
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		w.Write([]byte("ok"))
@@ -96,7 +102,7 @@ func initRoutes(r *chi.Mux) {
 		})
 
 		r.Get("/presign", func(writer http.ResponseWriter, request *http.Request) {
-			token := createTokenWithExpire(env.JwtSecret, defaultPresignLifeMs)
+			token := createTokenWithExpire(env.JwtSecret, env.PresignLifeMs)
 			writeResponse(writer, PresignTokenResponse{
 				Token: token,
 			}, 200)
@@ -111,7 +117,7 @@ func initRoutes(r *chi.Mux) {
 				return
 			}
 
-			if !isTokenValid(env.JwtSecret, token) {
+			if !isTokenValid(token, env.JwtSecret) {
 				writeError(w, "Invalid presigned token", "INVALID_PRESIGNED_TOKEN", 403)
 				return
 			}
@@ -129,26 +135,46 @@ func initRoutes(r *chi.Mux) {
 				return
 			}
 
-			createdFName, err := writeFileToDisk(fileHeaders[0], env.FileStorageDirectory)
+			createdFName, err := writeFileToDiskFHeader(fileHeaders[0], env.FileStorageDirectory)
 			if err != nil {
 				writeError(w, "Failed to write file to a disk", "WRITE_FILE_TO_DISK_FAILED", 500)
 				return
 			}
-
-			println(createdFName)
-			panic("implementation WIP")
-
-			//w.WriteHeader(200)
+			writeResponse(w, UploadFileResponse{FileName: createdFName}, 200)
 		})
 	})
 }
 
-func writeFileToDisk(fHeader *multipart.FileHeader, filesDirectory string) (string, error) {
+func writeFileToDiskFHeader(fHeader *multipart.FileHeader, filesDirectory string) (string, error) {
 	fHandle, err := fHeader.Open()
+	defer fHandle.Close()
 	if err != nil {
 		return "", err
 	}
-	defer fHandle.Close()
+
+	diskFile, err := os.CreateTemp(filesDirectory, "")
+	if err != nil {
+		return "", err
+	}
+
+	written, err := io.Copy(diskFile, fHandle)
+	if err != nil {
+		return "", err
+	}
+
+	if written == 0 {
+		return "", written0BytesError
+	}
+
+	// 1: to remove forward slash
+	return strings.TrimPrefix(diskFile.Name(), filesDirectory)[1:], nil
+}
+
+func writeFileToDisk(fName string, filesDirectory string) (string, error) {
+	fHandle, err := os.Open(fName)
+	if err != nil {
+		return "", err
+	}
 
 	diskFile, err := os.CreateTemp(filesDirectory, "")
 	if err != nil {
@@ -223,22 +249,24 @@ func mustBindEnv() {
 	env.ServerPort = serverPort
 
 	presignLifeMsString := os.Getenv("PRESIGN_LIFE_MS")
-	env.PresignLifeMs = defaultPresignLifeMs
+	env.PresignLifeMs = defaultPresignLifeMs * time.Millisecond
 
 	if presignLifeMsString != "" {
 		resignedLife, err := strconv.Atoi(presignLifeMsString)
 		if err != nil {
 			logError(fmt.Sprintf("Invalid PRESIGN_LIFE_MS, falling back to default: [%d]ms", env.PresignLifeMs))
 		}
-		env.PresignLifeMs = resignedLife
+		env.PresignLifeMs = time.Duration(resignedLife) * time.Millisecond
 	}
 
 	fileStorageDir := os.Getenv("FILE_STORAGE_DIRECTORY")
 	if fileStorageDir == "" {
 		logInfo(fmt.Sprintf("FILE_STORAGE_DIRECTORY not specified, using default: [%s]", defaultFileStorageDirectory))
-		err := os.Mkdir(defaultFileStorageDirectory, 0777)
-		if err != nil {
-			panic(fmt.Sprintf("Could not create default file storage directory!: %s", err.Error()))
+		if _, err := os.Stat(defaultFileStorageDirectory); os.IsNotExist(err) {
+			err := os.Mkdir(defaultFileStorageDirectory, 0777)
+			if err != nil {
+				panic(fmt.Sprintf("Could not create default file storage directory!: %s", err.Error()))
+			}
 		}
 		env.FileStorageDirectory = defaultFileStorageDirectory
 	} else {
