@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v5"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,13 +17,15 @@ import (
 )
 
 type Environment struct {
-	JwtSecret     string `json:"jwtSecret"`
-	ServerPort    string `json:"serverPort"`
-	PresignLifeMs int    `json:"presignLifeMs"`
+	JwtSecret            string `json:"jwtSecret"`
+	ServerPort           string `json:"serverPort"`
+	PresignLifeMs        int    `json:"presignLifeMs"`
+	FileStorageDirectory string `json:"fileStorageDirectory"`
 }
 
 type ErrorMessage struct {
-	Error string `json:"error"`
+	Error     string `json:"error"`
+	ErrorCode string `json:"errorCode"`
 }
 
 type PresignedTokens struct {
@@ -45,8 +49,16 @@ const (
 	defaultServerPort           = "8080"
 	defaultPresignLifeMs        = 1000 * 60 * 5
 	defaultTokenCleanerInterval = 5 * time.Minute
+	defaultFileStorageDirectory = "files"
+)
 
+const (
 	presignTokenQueryParamName = "presignToken"
+	multipartFormMaxMemory     = 0
+)
+
+var (
+	written0BytesError = fmt.Errorf("written 0 bytes")
 )
 
 func main() {
@@ -90,18 +102,69 @@ func initRoutes(r *chi.Mux) {
 			}, 200)
 		})
 	})
+
 	r.Route("/upload", func(r chi.Router) {
-		r.Post("/", func(writer http.ResponseWriter, r *http.Request) {
+		r.Post("/", func(w http.ResponseWriter, r *http.Request) {
 			token := r.URL.Query().Get(presignTokenQueryParamName)
 			if token == "" {
-				writeError(writer, fmt.Sprintf("[%s] queryParam is missing", presignTokenQueryParamName), 400)
+				writeError(w, fmt.Sprintf("[%s] queryParam is missing", presignTokenQueryParamName), "QUERY_PARAM_MISSING", 400)
+				return
 			}
 
 			if !isTokenValid(env.JwtSecret, token) {
-				writeError(writer, "Invalid presigned token", 403)
+				writeError(w, "Invalid presigned token", "INVALID_PRESIGNED_TOKEN", 403)
+				return
 			}
+
+			err := r.ParseMultipartForm(multipartFormMaxMemory)
+			if err != nil {
+				writeError(w, "Could not parse multipart form", "INVALID_MULTIPART_FORM", 500)
+				return
+			}
+
+			fileHeaders := r.MultipartForm.File["file"]
+
+			if len(fileHeaders) != 1 {
+				writeError(w, "You must provide exactly one file", "INVALID_AMOUNT_OF_FILES", 400)
+				return
+			}
+
+			createdFName, err := writeFileToDisk(fileHeaders[0], env.FileStorageDirectory)
+			if err != nil {
+				writeError(w, "Failed to write file to a disk", "WRITE_FILE_TO_DISK_FAILED", 500)
+				return
+			}
+
+			println(createdFName)
+			panic("implementation WIP")
+
+			//w.WriteHeader(200)
 		})
 	})
+}
+
+func writeFileToDisk(fHeader *multipart.FileHeader, filesDirectory string) (string, error) {
+	fHandle, err := fHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	defer fHandle.Close()
+
+	diskFile, err := os.CreateTemp(filesDirectory, "")
+	if err != nil {
+		return "", err
+	}
+
+	written, err := io.Copy(diskFile, fHandle)
+	if err != nil {
+		return "", err
+	}
+
+	if written == 0 {
+		return "", written0BytesError
+	}
+
+	return diskFile.Name(), nil
 }
 
 func startTokenCleaner(cleanEveryMs time.Duration) {
@@ -170,6 +233,18 @@ func mustBindEnv() {
 		env.PresignLifeMs = resignedLife
 	}
 
+	fileStorageDir := os.Getenv("FILE_STORAGE_DIRECTORY")
+	if fileStorageDir == "" {
+		logInfo(fmt.Sprintf("FILE_STORAGE_DIRECTORY not specified, using default: [%s]", defaultFileStorageDirectory))
+		err := os.Mkdir(defaultFileStorageDirectory, 0777)
+		if err != nil {
+			panic(fmt.Sprintf("Could not create default file storage directory!: %s", err.Error()))
+		}
+		env.FileStorageDirectory = defaultFileStorageDirectory
+	} else {
+		env.FileStorageDirectory = fileStorageDir
+	}
+
 }
 
 func validToken(next http.Handler) http.Handler {
@@ -178,7 +253,7 @@ func validToken(next http.Handler) http.Handler {
 		apiKeyParts := strings.Split(apiKey, "Bearer ")
 
 		if len(apiKeyParts) != 2 {
-			writeError(w, "authorization header is not in a valid format", 400)
+			writeError(w, "authorization header is not in a valid format", "INVALID_BEARER_HEADER_FORMAT", 400)
 			return
 		}
 
@@ -189,13 +264,14 @@ func validToken(next http.Handler) http.Handler {
 			return
 		}
 
-		writeError(w, "Invalid api key", 403)
+		writeError(w, "Invalid api key", "INVALID_API_KEY", 403)
 	})
 }
 
-func writeError(w http.ResponseWriter, errorMessage string, errorCode int) {
+func writeError(w http.ResponseWriter, errorMessage string, errorCode string, httpCode int) {
 	errContent := ErrorMessage{
-		Error: errorMessage,
+		Error:     errorMessage,
+		ErrorCode: errorCode,
 	}
 
 	respBody, err := json.Marshal(errContent)
@@ -204,7 +280,7 @@ func writeError(w http.ResponseWriter, errorMessage string, errorCode int) {
 	}
 
 	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(errorCode)
+	w.WriteHeader(httpCode)
 	w.Write(respBody)
 }
 
