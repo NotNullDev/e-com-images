@@ -19,9 +19,9 @@ func Test_createToken(t *testing.T) {
 	token := createToken(secret)
 	println(token)
 
-	isValid := isTokenValid(token, secret)
+	_, ok := isTokenValid(token, secret)
 
-	if !isValid {
+	if !ok {
 		t.Fatalf("token didn't passed validation")
 		return
 	}
@@ -33,9 +33,9 @@ func Test_expiredTokenIsNotValid(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 5)
 
-	isValid := isTokenValid(token, secret)
+	_, ok := isTokenValid(token, secret)
 
-	if isValid {
+	if ok {
 		t.Fatalf("token is valid but should be expired")
 		return
 	}
@@ -45,9 +45,9 @@ func Test_nonExpiredTokenIsValid(t *testing.T) {
 	token := createTokenWithExpire(secret, time.Second*10)
 	println(token)
 
-	isValid := isTokenValid(token, secret)
+	_, ok := isTokenValid(token, secret)
 
-	if !isValid {
+	if !ok {
 		t.Fatalf("token should be valid but is not")
 		return
 	}
@@ -72,8 +72,9 @@ func Test_healthEndpointIsWorking(t *testing.T) {
 
 func Test_PresignWorksWithDefaultJWT(t *testing.T) {
 	os.Setenv("JWT_SECRET", secret)
+	os.Setenv("ADMIN_KEY", secret)
+
 	mustBindEnv()
-	createAndPrintJwt()
 
 	router := NewRouter()
 	server := httptest.NewServer(router)
@@ -86,7 +87,7 @@ func Test_PresignWorksWithDefaultJWT(t *testing.T) {
 	req := http.Request{
 		URL: presignUrl,
 		Header: map[string][]string{
-			"Authorization": {"Bearer " + createdToken},
+			"Authorization": {"Bearer " + secret},
 		},
 		Method: "GET",
 	}
@@ -105,8 +106,8 @@ func Test_PresignWorksWithDefaultJWT(t *testing.T) {
 
 func Test_PresignDoesntWorksWithModifiedDefaultJWT(t *testing.T) {
 	os.Setenv("JWT_SECRET", secret)
+	os.Setenv("ADMIN_KEY", secret)
 	mustBindEnv()
-	createAndPrintJwt()
 
 	router := NewRouter()
 	server := httptest.NewServer(router)
@@ -116,20 +117,20 @@ func Test_PresignDoesntWorksWithModifiedDefaultJWT(t *testing.T) {
 
 	presignUrl, _ := url.Parse(server.URL + "/images/presign")
 
-	tokenBytes := []byte(createdToken)
+	tokenBytes := []byte(secret)
 
-	lastLetter := tokenBytes[len(createdToken)-1]
+	lastLetter := tokenBytes[len(secret)-1]
 	if lastLetter == 'a' {
-		tokenBytes[len(createdToken)-1] = 'b'
+		tokenBytes[len(secret)-1] = 'b'
 	} else {
-		tokenBytes[len(createdToken)-1] = 'a'
+		tokenBytes[len(secret)-1] = 'a'
 	}
-	createdToken = string(tokenBytes)
+	modifiedSecret := string(tokenBytes)
 
 	req := http.Request{
 		URL: presignUrl,
 		Header: map[string][]string{
-			"Authorization": {"Bearer " + createdToken},
+			"Authorization": {"Bearer " + modifiedSecret},
 		},
 		Method: "GET",
 	}
@@ -165,16 +166,6 @@ func BenchmarkWriteToDiskAlloc(b *testing.B) {
 		fNames = append(fNames, temp.Name())
 	}
 
-	defer func() {
-		for _, fName := range fNames {
-			err := os.Remove(fName)
-			if err != nil {
-				println(err.Error())
-			}
-		}
-		fmt.Printf("Removed %d files", len(fNames))
-	}()
-
 	b.ResetTimer()
 	b.ReportAllocs()
 
@@ -188,8 +179,11 @@ func BenchmarkWriteToDiskAlloc(b *testing.B) {
 	}
 
 	b.StopTimer()
-}
-
-func toTest() {
-	time.Sleep(1 * time.Second)
+	for _, fName := range fNames {
+		err := os.Remove(fName)
+		if err != nil {
+			println(err.Error())
+		}
+	}
+	fmt.Printf("Removed %d files", len(fNames))
 }

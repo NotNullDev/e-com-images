@@ -1,0 +1,29 @@
+# fly.toml app configuration file generated for e-com-images on 2023-10-24T19:29:25+02:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = "e-com-images"
+primary_region = "waw"
+
+[deploy]
+  max-per-region = 1
+
+[mounts]
+  source="e_com_images_data"
+  destination="/data"
+
+[build]
+  builder = "paketobuildpacks/builder:base"
+  buildpacks = ["gcr.io/paketo-buildpacks/go"]
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
