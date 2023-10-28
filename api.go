@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/golang-jwt/jwt/v5"
 	"net/http"
 	"os"
@@ -18,21 +20,28 @@ func NewRouter() *chi.Mux {
 
 func initRoutes(r *chi.Mux) {
 	r.Handle("/public/*", http.StripPrefix("/public/", http.FileServer(http.Dir(env.FileStorageDirectory))))
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Recoverer)
+		r.Use(middleware.Logger)
+		r.Use(cors.Handler(cors.Options{
+			AllowOriginFunc: func(r *http.Request, origin string) bool { return true },
+		}))
 
-	r.Get("/health", GetHealth())
+		r.Get("/health", GetHealth())
 
-	r.Route("/upload", func(r chi.Router) {
-		r.Post("/", PostUpload())
-	})
+		r.Route("/upload", func(r chi.Router) {
+			r.Post("/", PostUpload())
+		})
 
-	r.Route("/images", func(r chi.Router) {
-		r.Use(validAdminTokenMiddleware)
+		r.Route("/images", func(r chi.Router) {
+			r.Use(validAdminTokenMiddleware)
 
-		r.Get("/presign", GetImagesPresign())
+			r.Get("/presign", GetImagesPresign())
 
-		r.Get("/", GetImages())
+			r.Get("/", GetImages())
 
-		r.Delete("/{id}", DeleteById)
+			r.Delete("/{id}", DeleteById)
+		})
 	})
 }
 

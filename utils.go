@@ -91,8 +91,12 @@ func writeError(w http.ResponseWriter, errorMessage string, errorCode string, ht
 
 	respBody, err := json.Marshal(errContent)
 	if err != nil {
+		logError(err.Error())
+		logError("Failed to marshall errContent!")
 		return
 	}
+
+	log.Printf("[API_ERROR] Error: [%s]", string(respBody))
 
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(httpCode)
